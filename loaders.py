@@ -13,28 +13,8 @@ from h3 import latlng_to_cell
 
 
 @st.cache_data(show_spinner=False)
-from pathlib import Path
-import geopandas as gpd
-import streamlit as st
-
-@st.cache_data(show_spinner=False)
 def load_zones(path: str, zone_field: str, simplify_tolerance: float) -> gpd.GeoDataFrame:
-    p = Path(path)
-
-    if not p.exists():
-        raise FileNotFoundError(f"Zones file not found: {p}")
-
-    if p.suffix.lower() == ".shp":
-        required = [
-            p,
-            p.with_suffix(".shx"),
-            p.with_suffix(".dbf"),
-        ]
-        missing = [str(x) for x in required if not x.exists()]
-        if missing:
-            raise FileNotFoundError(f"Missing shapefile components: {missing}")
-
-    gdf = gpd.read_file(p, engine="pyogrio")
+    gdf = gpd.read_file(path)
 
     if zone_field not in gdf.columns:
         raise ValueError(f"Field '{zone_field}' not found. Available: {list(gdf.columns)}")
