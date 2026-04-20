@@ -310,7 +310,9 @@ def fetch_gtfs_rt_vehicle_positions(vehicle_url: str) -> pd.DataFrame:
     if df.empty:
         return df
 
-    df["timestamp_dt"] = pd.to_datetime(df["timestamp"], unit="s", errors="coerce")
+    df["timestamp_dt"] = (
+    pd.to_datetime(df["timestamp"], unit="s", utc=True, errors="coerce")
+      .dt.tz_convert("Europe/Rome"))
     return df
 
 

@@ -10,6 +10,7 @@ TRIP_POINTS_PATH = DATA_DIR / "trips" / "day=1_trips_passing_rome.parquet"
 
 GTFS_STATIC_PATH = DATA_DIR / "gtfs"
 OSM_ROADS_PATH = DATA_DIR / "roads" / "rome_drive_edges.parquet"
+GTFS_HISTORY_PATH = DATA_DIR / "gtfs_history.parquet"
 
 VEHICLE_URL = "https://romamobilita.it/sites/default/files/rome_rtgtfs_vehicle_positions_feed.pb"
 TRIP_UPDATES_URL = "https://romamobilita.it/sites/default/files/rome_rtgtfs_trip_updates_feed.pb"
