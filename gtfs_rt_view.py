@@ -1,16 +1,14 @@
-import json
-from pathlib import Path
-
 import folium
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
 from google.transit import gtfs_realtime_pb2
-from streamlit_folium import st_folium
 from streamlit_autorefresh import st_autorefresh
+from streamlit_folium import st_folium
 
-from config import GTFS_HISTORY_PATH, MAP_CENTER, MAP_ZOOM, TRIP_UPDATES_URL, VEHICLE_URL
+from config import MAP_CENTER, MAP_ZOOM, TRIP_UPDATES_URL, VEHICLE_URL
+from db import load_gtfs_last_24h
 from loaders import (
     fetch_gtfs_rt_vehicle_positions,
     join_vehicle_positions_with_routes,
@@ -113,6 +111,7 @@ def fetch_gtfs_rt_trip_updates(trip_updates_url: str) -> pd.DataFrame:
         best_stop_id = None
         best_delay = trip_delay
 
+        # current implementation still uses the first stop_time_update if present
         if len(tu.stop_time_update) > 0:
             stu = tu.stop_time_update[0]
             if stu.stop_id:
@@ -311,109 +310,10 @@ def build_route_direction_stats(vehicle_df: pd.DataFrame) -> pd.DataFrame:
     return grouped
 
 
-def update_hourly_delay_store(vehicle_df: pd.DataFrame, stats_path: Path = GTFS_HISTORY_PATH) -> None:
-    """
-    Persist lightweight snapshot aggregates for later 24h profiling.
-    History is stored from the full unfiltered live feed.
-    Delay magnitude metrics exclude negative values.
-    """
-    if vehicle_df.empty or "timestamp_dt" not in vehicle_df.columns:
-        return
-
-    df = vehicle_df.copy()
-    df["timestamp_dt"] = pd.to_datetime(df["timestamp_dt"], errors="coerce")
-    df = df.dropna(subset=["timestamp_dt"]).copy()
-    if df.empty:
-        return
-
-    ts = df["timestamp_dt"].max()
-    if pd.isna(ts):
-        return
-
-    df["delay_status"] = df["delay_status"].fillna("unknown")
-    df["delay_min"] = pd.to_numeric(df["delay_min"], errors="coerce")
-
-    n_buses = int(df["vehicle_id"].nunique()) if "vehicle_id" in df.columns else int(len(df))
-    delayed = int((df["delay_status"] == "delayed").sum())
-    pct_delayed = round(100.0 * delayed / n_buses, 2) if n_buses > 0 else 0.0
-
-    positive_delays = df.loc[df["delay_min"] > 0, "delay_min"].dropna()
-
-    avg_delay_min = round(positive_delays.mean(), 2) if not positive_delays.empty else np.nan
-    p95_delay_min = round(float(positive_delays.quantile(0.95)), 2) if not positive_delays.empty else np.nan
-    min_delay_min = round(positive_delays.min(), 2) if not positive_delays.empty else np.nan
-    max_delay_min = round(positive_delays.max(), 2) if not positive_delays.empty else np.nan
-
-    snapshot_time = ts.floor("min")
-    row = pd.DataFrame(
-        [
-            {
-                "snapshot_time": snapshot_time,
-                "date": snapshot_time.date().isoformat(),
-                "hour": int(snapshot_time.hour),
-                "n_buses": n_buses,
-                "delayed": delayed,
-                "pct_delayed": pct_delayed,
-                "avg_delay_min": avg_delay_min,
-                "p95_delay_min": p95_delay_min,
-                "min_delay_min": min_delay_min,
-                "max_delay_min": max_delay_min,
-            }
-        ]
-    )
-
-    stats_path.parent.mkdir(parents=True, exist_ok=True)
-
-    if stats_path.exists():
-        try:
-            old = pd.read_parquet(stats_path)
-            combined = pd.concat([old, row], ignore_index=True)
-        except Exception:
-            combined = row.copy()
-    else:
-        combined = row.copy()
-
-    combined["snapshot_time"] = pd.to_datetime(combined["snapshot_time"], errors="coerce")
-    combined = combined.drop_duplicates(subset=["snapshot_time"], keep="last")
-    combined = combined.sort_values("snapshot_time").reset_index(drop=True)
-
-    combined.to_parquet(stats_path, index=False)
-
-
-def load_hourly_delay_store(stats_path: Path = GTFS_HISTORY_PATH) -> pd.DataFrame:
-    empty = pd.DataFrame(
-        columns=[
-            "snapshot_time",
-            "date",
-            "hour",
-            "n_buses",
-            "delayed",
-            "pct_delayed",
-            "avg_delay_min",
-            "p95_delay_min",
-            "min_delay_min",
-            "max_delay_min",
-        ]
-    )
-
-    if not stats_path.exists():
-        return empty
-
-    try:
-        df = pd.read_parquet(stats_path)
-    except Exception:
-        return empty
-
-    if "snapshot_time" in df.columns:
-        df["snapshot_time"] = pd.to_datetime(df["snapshot_time"], errors="coerce")
-
-    return df
-
-
 def build_last_24h_delay_profile(stats_store_df: pd.DataFrame) -> pd.DataFrame:
     if stats_store_df.empty:
-        now_hour = pd.Timestamp.now().floor("h")
-        full_hours = pd.date_range(end=now_hour, periods=24, freq="h")
+        now_hour = pd.Timestamp.now(tz="Europe/Rome").floor("h")
+        full_hours = pd.date_range(end=now_hour, periods=24, freq="h", tz="Europe/Rome")
         return pd.DataFrame(
             {
                 "hour_ts": full_hours,
@@ -425,15 +325,18 @@ def build_last_24h_delay_profile(stats_store_df: pd.DataFrame) -> pd.DataFrame:
         )
 
     df = stats_store_df.copy()
-    df["snapshot_time"] = pd.to_datetime(df["snapshot_time"], errors="coerce")
+
+    df["snapshot_time"] = pd.to_datetime(df["snapshot_time"], errors="coerce", utc=True)
+    df = df.dropna(subset=["snapshot_time"]).copy()
+    df["snapshot_time"] = df["snapshot_time"].dt.tz_convert("Europe/Rome")
+
     df["pct_delayed"] = pd.to_numeric(df["pct_delayed"], errors="coerce")
     df["avg_delay_min"] = pd.to_numeric(df["avg_delay_min"], errors="coerce")
     df["p95_delay_min"] = pd.to_numeric(df["p95_delay_min"], errors="coerce")
-    df = df.dropna(subset=["snapshot_time"]).copy()
 
     if df.empty:
-        now_hour = pd.Timestamp.now().floor("h")
-        full_hours = pd.date_range(end=now_hour, periods=24, freq="h")
+        now_hour = pd.Timestamp.now(tz="Europe/Rome").floor("h")
+        full_hours = pd.date_range(end=now_hour, periods=24, freq="h", tz="Europe/Rome")
         return pd.DataFrame(
             {
                 "hour_ts": full_hours,
@@ -448,19 +351,6 @@ def build_last_24h_delay_profile(stats_store_df: pd.DataFrame) -> pd.DataFrame:
     min_ts = max_ts - pd.Timedelta(hours=23)
 
     df = df[(df["snapshot_time"] >= min_ts) & (df["snapshot_time"] < max_ts + pd.Timedelta(hours=1))].copy()
-
-    if df.empty:
-        full_hours = pd.date_range(start=min_ts, end=max_ts, freq="h")
-        return pd.DataFrame(
-            {
-                "hour_ts": full_hours,
-                "avg_pct_delayed": [0.0] * len(full_hours),
-                "avg_delay_min": [0.0] * len(full_hours),
-                "p95_delay_min": [0.0] * len(full_hours),
-                "n_snapshots": [0] * len(full_hours),
-            }
-        )
-
     df["hour_ts"] = df["snapshot_time"].dt.floor("h")
 
     grouped = (
@@ -469,11 +359,13 @@ def build_last_24h_delay_profile(stats_store_df: pd.DataFrame) -> pd.DataFrame:
             avg_pct_delayed=("pct_delayed", "mean"),
             avg_delay_min=("avg_delay_min", "mean"),
             p95_delay_min=("p95_delay_min", "mean"),
-            n_snapshots=("snapshot_time", "nunique"),
+            n_snapshots=("snapshot_time", "count"),
         )
     )
 
-    full_hours = pd.DataFrame({"hour_ts": pd.date_range(start=min_ts, end=max_ts, freq="h")})
+    full_hours = pd.DataFrame(
+        {"hour_ts": pd.date_range(start=min_ts, end=max_ts, freq="h", tz="Europe/Rome")}
+    )
     grouped = full_hours.merge(grouped, on="hour_ts", how="left").fillna(0)
 
     grouped["avg_pct_delayed"] = grouped["avg_pct_delayed"].round(1)
@@ -588,6 +480,8 @@ def render_gtfs_rt_view(zones, zone_field, choices, gtfs_static_path):
     st_autorefresh(interval=auto_refresh * 1000, key="gtfs_live_refresh")
 
     routes_df, stops_gdf = load_gtfs_static(gtfs_static_path)
+
+    # live current view from GTFS-RT
     vehicle_df = fetch_gtfs_rt_vehicle_positions(VEHICLE_URL)
     vehicle_df = join_vehicle_positions_with_routes(vehicle_df, routes_df)
 
@@ -599,13 +493,11 @@ def render_gtfs_rt_view(zones, zone_field, choices, gtfs_static_path):
     trip_updates_df = fetch_gtfs_rt_trip_updates(TRIP_UPDATES_URL)
     vehicle_df = enrich_vehicle_positions_with_delay(vehicle_df, trip_updates_df)
 
-    # Store history from the full live dataset before applying user filters.
-    vehicle_df_all = vehicle_df.copy()
-    update_hourly_delay_store(vehicle_df_all, GTFS_HISTORY_PATH)
-    hourly_store_df = load_hourly_delay_store(GTFS_HISTORY_PATH)
-    hourly_delay_df = build_last_24h_delay_profile(hourly_store_df)
+    # history comes only from DB, never from UI-triggered local writes
+    history_df = load_gtfs_last_24h()
+    hourly_delay_df = build_last_24h_delay_profile(history_df)
 
-    # Filters affect display only, not stored history.
+    # UI filters apply only to the current live view
     if only_route.strip():
         vehicle_df = vehicle_df[vehicle_df["route_id"].astype(str) == only_route.strip()].copy()
 
@@ -629,20 +521,13 @@ def render_gtfs_rt_view(zones, zone_field, choices, gtfs_static_path):
     st_folium(m, width=None, height=760)
 
     st.subheader("Delayed buses in the last 24 hours")
-    st.line_chart(
-        hourly_delay_df.set_index("hour_ts")[["avg_pct_delayed"]],
-        height=260,
-    )
-
-    st.subheader("Positive delay magnitude in the last 24 hours")
-    st.line_chart(
-        hourly_delay_df.set_index("hour_ts")[["avg_delay_min", "p95_delay_min"]],
-        height=260,
-    )
-
+    chart_df = hourly_delay_df.set_index("hour_ts")[["avg_pct_delayed", "avg_delay_min", "p95_delay_min"]]
+    st.line_chart(chart_df, height=300)
     st.caption(
+        "Each point is one hourly bin in the rolling last 24 hours. "
         "Average delay and P95 delay are computed only on positive delays."
     )
+
     with st.expander("Overall GTFS-RT summary", expanded=True):
         st.dataframe(overall_stats_df, use_container_width=True)
 
@@ -654,6 +539,9 @@ def render_gtfs_rt_view(zones, zone_field, choices, gtfs_static_path):
 
     with st.expander("Last 24 hours delay table", expanded=False):
         st.dataframe(hourly_delay_df, use_container_width=True)
+
+    with st.expander("Raw DB snapshots", expanded=False):
+        st.dataframe(history_df, use_container_width=True)
 
     with st.expander("Live vehicle table"):
         if vehicle_df.empty:
