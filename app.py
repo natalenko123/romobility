@@ -14,6 +14,8 @@ from desire_lines_view import render_desire_lines_view
 from gtfs_rt_view import render_gtfs_rt_view
 from loaders import load_zones
 from map_utils import prepare_zone_choices
+from route_performance_view import render_route_performance_view
+from segment_performance_view import render_segment_performance_view
 from state import apply_pending_zone_updates, ensure_state_defaults
 from travel_time_view import render_travel_time_view
 from trips_view import render_trips_view
@@ -42,6 +44,8 @@ def main():
                 "Corridor usage between two quartieri",
                 "Desire lines between quartieri",
                 "Live buses (GTFS-RT)",
+                "Route performance",
+                "Segment performance",
             ],
             index=4,
         )
@@ -59,8 +63,7 @@ def main():
     choices = prepare_zone_choices(zones, zone_field)
     ensure_state_defaults(choices)
 
-    # show shared hour filter only for tabs that actually use it
-    if app_mode != "Live buses (GTFS-RT)":
+    if app_mode not in ["Live buses (GTFS-RT)", "Route performance", "Segment performance"]:
         st.slider("Hour range", 0, 23, (0, 23), 1, key="shared_hour_range")
         hour_min, hour_max = st.session_state["shared_hour_range"]
 
@@ -107,6 +110,14 @@ def main():
             zones=zones,
             zone_field=zone_field,
             choices=choices,
+            gtfs_static_path=gtfs_static_path,
+        )
+    elif app_mode == "Route performance":
+        render_route_performance_view(
+            gtfs_static_path=gtfs_static_path,
+        )
+    elif app_mode == "Segment performance":
+        render_segment_performance_view(
             gtfs_static_path=gtfs_static_path,
         )
 
